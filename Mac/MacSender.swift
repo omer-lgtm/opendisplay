@@ -333,6 +333,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // SCDisplay reports points; capture at point resolution for M1.
             let captureW = (Int(Double(display.width) * quality.scale)) & ~1
             let captureH = (Int(Double(display.height) * quality.scale)) & ~1
+            // Mirror mode used to stream correctly but silently discarded every
+            // touch message because only setupExtend() created an injector.
+            // Target the captured physical display just like extend targets its
+            // virtual display.
+            inputInjector = InputInjector(displayID: display.displayID)
             try await startCapture(display: display, pixelsWide: captureW, pixelsHigh: captureH)
 
         case .extend:
@@ -347,19 +352,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             let info = try await waitForHello()
             try await setupExtend(info)
 
-            // Touch back-channel (Milestone 3). Needs Accessibility trust;
-            // streaming works without it, so don't interrupt with a prompt —
-            // the permission panel's Grant button asks when the user is ready.
-            if !AXIsProcessTrusted() {
-                await status("Extending — grant Accessibility for touch input")
-                // Event posting is trust-checked per-post, so it starts working
-                // the moment the user grants — poll just to log/report it.
-                while !AXIsProcessTrusted() {
-                    try await Task.sleep(for: .seconds(2))
-                    if stopped { return }
-                }
-                Log.info("Accessibility permission granted — touch input live")
+        }
+
+        // Touch back-channel works in both mirror and extend modes. Streaming
+        // remains available while Accessibility is missing; the permission
+        // panel's Grant button asks when the user is ready.
+        if !AXIsProcessTrusted() {
+            await status("\(mode == .extend ? "Extending" : "Mirroring") — grant Accessibility for touch input")
+            // Event posting is trust-checked per-post, so it starts working the
+            // moment the user grants — poll only to log/report the transition.
+            while !AXIsProcessTrusted() {
+                try await Task.sleep(for: .seconds(2))
+                if stopped { return }
             }
+            Log.info("Accessibility permission granted — touch input live")
         }
     }
 

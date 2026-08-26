@@ -70,6 +70,8 @@ targets:
         SUEnableAutomaticChecks: true
     settings:
       base:
+        SDKROOT: macosx
+        SUPPORTED_PLATFORMS: macosx
         PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac
         PRODUCT_NAME: OpenDisplay
         BUNDLE_DISPLAY_NAME: OpenDisplay
@@ -96,9 +98,13 @@ targets:
       - Mac/DisplayArrangement.swift
       - Mac/Log.swift
       - Mac/LogPolicies.swift
+      - Mac/RemoteEndpoint.swift
       - Shared/LogSnapshot.swift
     settings:
       base:
+        SDKROOT: macosx
+        SUPPORTED_PLATFORMS: macosx
+        PRODUCT_NAME: OpenSidecarMacTests
         # A hostless test bundle: the sources under test are compiled straight
         # into it, so there is no app to inject into and nothing to load from.
         TEST_HOST: ""
@@ -132,6 +138,9 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
     settings:
       base:
+        SDKROOT: iphoneos
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
         PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.ios
+        PRODUCT_NAME: OpenDisplay
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

@@ -252,6 +252,24 @@ Open the iPhone app, then pick **"iPhone (WiFi)"** from the Connection menu
 in the Mac app. Discovery is automatic via Bonjour. USB has lower latency;
 WiFi has no cable.
 
+### Run remotely (Tailscale)
+
+OpenDisplay's built-in WiFi protocol is intentionally LAN-only and has no TLS
+or password. **Never expose port 9000 with router port-forwarding.** For a
+private connection away from home:
+
+1. Install Tailscale on the Mac and iPhone/iPad and sign both into the same
+   tailnet.
+2. Open OpenDisplay on the iPhone/iPad so its receiver is listening.
+3. In the Mac app, open **Secure Remote**, enter the device's Tailscale IP or
+   MagicDNS name and port `9000`, then click **Connect Remote**.
+4. Enable **Connect automatically** if the Mac should retry that private
+   address whenever OpenDisplay starts.
+
+Tailscale provides authentication, encryption, and NAT traversal; OpenDisplay
+still provides the display stream and touch channel. iOS must keep the receiver
+app active to display and control the Mac.
+
 ### Permissions checklist
 
 macOS and iOS gate several things this app needs — most prompt on first use,

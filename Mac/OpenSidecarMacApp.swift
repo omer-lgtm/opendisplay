@@ -95,6 +95,9 @@ enum MainWindow {
 enum ConnectionTarget: Hashable {
     case usb(udid: String?)           // wired via built-in usbmuxd; nil = first device
     case wifi(NWBrowser.Result)       // discovered via Bonjour
+    // A private Tailnet address. The OpenDisplay wire remains plain TCP;
+    // Tailscale supplies authenticated encryption and NAT traversal.
+    case remote(host: String, port: UInt16)
 
     /// Stable identity for sessions and persistence — survives Bonjour
     /// re-discovery (fresh NWBrowser.Result) and USB replugs (new DeviceID).
@@ -104,6 +107,7 @@ enum ConnectionTarget: Hashable {
         case .wifi(let result):
             if case .service(let name, _, _, _) = result.endpoint { return "wifi:\(name)" }
             return "wifi:unknown"
+        case .remote(let host, let port): return "remote:\(host):\(port)"
         }
     }
 }
@@ -146,7 +150,10 @@ final class DeviceSession: ObservableObject, Identifiable {
     // and its service row.
     var wifiServiceName: String?
 
-    var transportLabel: String { onUSB ? "USB" : "WiFi" }
+    var transportLabel: String {
+        if case .remote = target { return "Remote · Tailscale" }
+        return onUSB ? "USB" : "WiFi"
+    }
 
     init(id: String, target: ConnectionTarget, name: String, sender: MacSender) {
         self.id = id
@@ -184,6 +191,18 @@ final class SenderController: ObservableObject {
     // (debugging escape hatch, e.g. an iproxy or SSH tunnel).
     @Published var host = UserDefaults.standard.string(forKey: "host") ?? "127.0.0.1"
     @Published var port = UserDefaults.standard.string(forKey: "port") ?? "9000"
+    @Published var remoteHost = UserDefaults.standard.string(forKey: "remoteHost") ?? "" {
+        didSet { UserDefaults.standard.set(remoteHost, forKey: "remoteHost") }
+    }
+    @Published var remotePort = UserDefaults.standard.string(forKey: "remotePort") ?? "9000" {
+        didSet { UserDefaults.standard.set(remotePort, forKey: "remotePort") }
+    }
+    @Published var remoteAutoConnect = UserDefaults.standard.bool(forKey: "remoteAutoConnect") {
+        didSet {
+            UserDefaults.standard.set(remoteAutoConnect, forKey: "remoteAutoConnect")
+            if remoteAutoConnect { connectRemote() }
+        }
+    }
     // `-mode mirror` / `-mode extend` launch argument also works.
     @Published var mode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .extend
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
@@ -326,6 +345,7 @@ final class SenderController: ObservableObject {
     private func autoConnect() {
         guard autoConnectEnabled else { return }
         dedupeSessions()
+        if remoteAutoConnect { connectRemote() }
         // The -host/-port escape hatch is an explicit choice — dial it like
         // the wired devices (it joins them, not replaces them).
         if UserDefaults.standard.object(forKey: "host") != nil,
@@ -399,6 +419,7 @@ final class SenderController: ObservableObject {
     /// overlapping browse events at worst repeat an idempotent call.
     private func endSessionsWhoseServiceVanished() {
         for session in sessions where !session.onUSB {
+            guard case .wifi = session.target else { continue }
             guard wifiService(for: session) == nil else { continue }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self, weak session] in
                 guard let self, let session,
@@ -458,6 +479,8 @@ final class SenderController: ObservableObject {
             return udid == nil ? "Manual (\(host):\(port))" : "iPhone / iPad"
         case .wifi(let result):
             return serviceName(of: result) ?? "WiFi device"
+        case .remote(let host, _):
+            return "Remote iPhone / iPad (\(host))"
         }
     }
 
@@ -505,6 +528,8 @@ final class SenderController: ObservableObject {
                 .flatMap { activeSession(coveringUSB: $0) }
         case .wifi(let result):
             covering = activeSession(coveringWiFi: result)
+        case .remote:
+            covering = nil
         default:
             covering = nil
         }
@@ -518,6 +543,7 @@ final class SenderController: ObservableObject {
         switch target {
         case .usb: usbDisabled.remove(id)
         case .wifi: wifiRemembered.insert(id)
+        case .remote: break
         }
 
         let transport: SenderTransport
@@ -533,6 +559,9 @@ final class SenderController: ObservableObject {
             }
         case .wifi(let result):
             transport = .tcp(result.endpoint)
+        case .remote(let host, let port):
+            transport = .tcp(.hostPort(host: NWEndpoint.Host(host),
+                                       port: NWEndpoint.Port(rawValue: port)!))
         }
 
         let name = label(for: target)
@@ -635,6 +664,7 @@ final class SenderController: ObservableObject {
         switch session.target {
         case .usb: usbDisabled.insert(session.id)
         case .wifi: wifiRemembered.remove(session.id)
+        case .remote: remoteAutoConnect = false
         }
         // A migrated session is also reachable the other way — opt that side
         // out too, or auto-connect resurrects the device moments later.
@@ -645,6 +675,18 @@ final class SenderController: ObservableObject {
 
     func disconnectAll() {
         sessions.forEach { disconnect($0) }
+    }
+
+    var remoteTarget: ConnectionTarget? {
+        let trimmed = remoteHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard RemoteEndpointValidator.isTailnetHost(trimmed),
+              let port = UInt16(remotePort), port > 0 else { return nil }
+        return .remote(host: trimmed, port: port)
+    }
+
+    func connectRemote() {
+        guard let target = remoteTarget else { return }
+        connect(to: target, userInitiated: true)
     }
 
     /// Restart a session that failed to start (its pipeline is already
@@ -741,8 +783,11 @@ final class SenderController: ObservableObject {
         // Sessions whose device vanished from discovery (e.g. Bonjour record
         // gone while the stream is still alive) keep a row to disconnect.
         for session in sessions where !coveredSessionIDs.contains(session.id) {
-            entries.append(DeviceEntry(id: session.id, name: session.name,
-                                       usbTarget: nil, wifiTarget: nil))
+            guard case .remote = session.target else {
+                entries.append(DeviceEntry(id: session.id, name: session.name,
+                                           usbTarget: nil, wifiTarget: nil))
+                continue
+            }
         }
         return entries
     }
@@ -872,6 +917,43 @@ struct ContentView: View {
                             }
                         }
                     }
+                }
+
+                Section("Secure Remote") {
+                    TextField("iPhone Tailnet IP or MagicDNS name", text: $controller.remoteHost)
+                        .textContentType(.URL)
+                    HStack {
+                        TextField("Port", text: $controller.remotePort)
+                            .frame(width: 72)
+                        Spacer()
+                        if let target = controller.remoteTarget,
+                           let session = controller.session(for: target.sessionID) {
+                            Text(session.status)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Button("Disconnect") { controller.disconnect(session) }
+                                .controlSize(.small)
+                        } else {
+                            Button("Connect Remote") { controller.connectRemote() }
+                                .controlSize(.small)
+                                .disabled(controller.remoteTarget == nil)
+                        }
+                    }
+                    Toggle("Connect automatically when OpenDisplay starts",
+                           isOn: $controller.remoteAutoConnect)
+                        .disabled(controller.remoteTarget == nil)
+                    Text("Install Tailscale on both devices, sign in to the same tailnet, then enter the iPhone/iPad Tailnet address. Do not use a public IP or router port-forward: OpenDisplay's own protocol has no TLS or password.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if !controller.remoteHost.isEmpty && controller.remoteTarget == nil {
+                        Text("Enter a Tailscale IP (100.64.0.0/10 or fd7a:115c:a1e0::/48) or a full .ts.net MagicDNS name, plus a valid port.")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                    Link("Open Tailscale setup guide",
+                         destination: URL(string: "https://tailscale.com/kb/1017/install")!)
+                        .font(.caption)
                 }
 
                 Picker("Mode", selection: $controller.mode) {
