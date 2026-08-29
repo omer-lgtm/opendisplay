@@ -76,6 +76,9 @@ targets:
         PRODUCT_NAME: OpenDisplay
         BUNDLE_DISPLAY_NAME: OpenDisplay
         SWIFT_OBJC_BRIDGING_HEADER: Mac/OpenSidecarMac-Bridging-Header.h
+        # Sparkle is embedded in Contents/Frameworks. Keep the standard app
+        # runpath so dyld can resolve @rpath/Sparkle.framework at launch.
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_ENTITLEMENTS: Mac/OpenSidecarMac.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
