@@ -41,6 +41,7 @@ struct ReceiverScreen: View {
     @State private var showSettings = false
     @State private var showOnboarding = false
     @State private var nagDismissed = false
+    @State private var keyboardVisible = false
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
@@ -77,6 +78,30 @@ struct ReceiverScreen: View {
                                    useMetal: metalRenderer)
                         .id(metalRenderer)   // rebuild the layer tree on toggle
                         .ignoresSafeArea()
+                    RemoteKeyboardBridge(isActive: $keyboardVisible,
+                                         onText: model.receiver.sendText,
+                                         onKey: model.receiver.sendKey)
+                        .frame(width: 1, height: 1)
+                        .opacity(0.01)
+                        .accessibilityHidden(true)
+                    VStack {
+                        HStack {
+                            Spacer()
+                            Button {
+                                keyboardVisible.toggle()
+                            } label: {
+                                Image(systemName: keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard")
+                                    .font(.title3.weight(.semibold))
+                                    .padding(11)
+                                    .background(.black.opacity(0.58), in: Circle())
+                                    .foregroundStyle(.white)
+                            }
+                            .accessibilityLabel(keyboardVisible ? "Hide remote keyboard" : "Show remote keyboard")
+                            .padding(.top, 12)
+                            .padding(.trailing, 12)
+                        }
+                        Spacer()
+                    }
                     if showAnalytics {
                         VStack {
                             Spacer()
@@ -123,6 +148,9 @@ struct ReceiverScreen: View {
         .task { await versionGate.check() }
         // Merge the connected Mac's compatibility signal into the same gate.
         .onReceive(model.receiver.$peerSignal) { versionGate.applyPeer($0) }
+        .onReceive(model.receiver.$keyboardRequestSerial.dropFirst()) { _ in
+            keyboardVisible = model.receiver.keyboardShouldShow
+        }
         .onReceive(NotificationCenter.default.publisher(for: .deviceDidShake)) { _ in
             showSettings = true
         }
@@ -171,6 +199,97 @@ struct ReceiverScreen: View {
             if !hasConnectedBefore && !onboardingDismissed {
                 showOnboarding = true
             }
+        }
+    }
+}
+
+// MARK: - Remote keyboard
+
+/// A real UITextField is required for iOS to present its software keyboard.
+/// The field never stores remote content: delegate callbacks are forwarded to
+/// the Mac and rejected locally, avoiding a second copy of sensitive text.
+private struct RemoteKeyboardBridge: UIViewRepresentable {
+    @Binding var isActive: Bool
+    let onText: (String) -> Void
+    let onKey: (String) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(isActive: $isActive, onText: onText, onKey: onKey)
+    }
+
+    func makeUIView(context: Context) -> UITextField {
+        let field = UITextField(frame: .zero)
+        field.delegate = context.coordinator
+        field.autocorrectionType = .yes
+        field.spellCheckingType = .yes
+        field.smartQuotesType = .yes
+        field.smartDashesType = .yes
+        field.returnKeyType = .default
+        field.textContentType = nil
+
+        let toolbar = UIToolbar()
+        toolbar.sizeToFit()
+        toolbar.items = [
+            UIBarButtonItem(title: "Esc", style: .plain, target: context.coordinator,
+                            action: #selector(Coordinator.escape)),
+            UIBarButtonItem(title: "Tab", style: .plain, target: context.coordinator,
+                            action: #selector(Coordinator.tab)),
+            UIBarButtonItem(systemItem: .flexibleSpace),
+            UIBarButtonItem(systemItem: .done, primaryAction: UIAction { _ in
+                context.coordinator.dismiss(field)
+            }),
+        ]
+        field.inputAccessoryView = toolbar
+        return field
+    }
+
+    func updateUIView(_ field: UITextField, context: Context) {
+        context.coordinator.onText = onText
+        context.coordinator.onKey = onKey
+        if isActive, !field.isFirstResponder {
+            DispatchQueue.main.async { field.becomeFirstResponder() }
+        } else if !isActive, field.isFirstResponder {
+            DispatchQueue.main.async { field.resignFirstResponder() }
+        }
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        @Binding var isActive: Bool
+        var onText: (String) -> Void
+        var onKey: (String) -> Void
+
+        init(isActive: Binding<Bool>, onText: @escaping (String) -> Void,
+             onKey: @escaping (String) -> Void) {
+            _isActive = isActive
+            self.onText = onText
+            self.onKey = onKey
+        }
+
+        func textField(_ textField: UITextField, shouldChangeCharactersIn range: NSRange,
+                       replacementString string: String) -> Bool {
+            if string.isEmpty {
+                for _ in 0..<max(range.length, 1) { onKey("delete") }
+            } else {
+                onText(string)
+            }
+            return false
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            onKey("return")
+            return false
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            isActive = false
+        }
+
+        @objc func escape() { onKey("escape") }
+        @objc func tab() { onKey("tab") }
+
+        func dismiss(_ field: UITextField) {
+            isActive = false
+            field.resignFirstResponder()
         }
     }
 }
@@ -499,13 +618,33 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section("Status") {
-                    LabeledContent("Listening", value: "Port 9000")
+                    LabeledContent("Private server", value: "Active · Port 9000")
                     LabeledContent("Connection",
                                    value: receiver.connected ? "Connected" : "Waiting for Mac")
                     if receiver.videoSize != .zero {
                         LabeledContent("Stream",
                                        value: "\(Int(receiver.videoSize.width))×\(Int(receiver.videoSize.height)) @ \(receiver.fps) fps")
                     }
+                }
+
+                Section {
+                    LabeledContent("Pairing code") {
+                        Text(receiver.formattedRemoteAccessCode)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                    Button {
+                        UIPasteboard.general.string = receiver.formattedRemoteAccessCode
+                    } label: {
+                        Label("Copy pairing code", systemImage: "doc.on.doc")
+                    }
+                    Button("Generate a new code", role: .destructive) {
+                        receiver.regenerateRemoteAccessCode()
+                    }
+                } header: {
+                    Text("Control from anywhere")
+                } footer: {
+                    Text("Copy this code into OpenDisplay on the Mac for every WiFi or remote connection. For control away from home, install Tailscale on both devices; remote access then requires both Tailscale identity and this secret. Never forward port 9000 on your router.")
                 }
 
                 Section {
@@ -563,6 +702,8 @@ struct SettingsView: View {
                           systemImage: "rectangle.portrait.rotate")
                     Label("Touch: tap to click, drag to drag, two-finger pan to scroll.",
                           systemImage: "hand.tap")
+                    Label("Keyboard: tap a Mac text field, or use the keyboard button while streaming.",
+                          systemImage: "keyboard")
                 } header: {
                     Text("How to connect")
                 }

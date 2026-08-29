@@ -32,6 +32,7 @@ final class InputInjector {
     // open but their tracking session breaks, leaving zombie menu windows
     // composited on the display (visible in the stream, unclickable).
     private let source = CGEventSource(stateID: .hidSystemState)
+    private var loggedUntrustedInput = false
     // Synthetic OpenDisplay tablet — conspicuous in logs; not Wacom (0x056A) or
     // typical small driver IDs (1, 2, …).
     private let tabletVendorID: Int64 = 0x0D15       // "ODIS"
@@ -72,7 +73,16 @@ final class InputInjector {
     }
 
     /// x/y are normalized [0,1] in video space (origin top-left).
-    func handleTouch(phase: String, x: Double, y: Double) {
+    @discardableResult
+    func handleTouch(phase: String, x: Double, y: Double) -> Bool {
+        guard AXIsProcessTrusted() else {
+            if !loggedUntrustedInput {
+                loggedUntrustedInput = true
+                Log.info("touch received but Accessibility is disabled — input dropped")
+            }
+            return false
+        }
+        loggedUntrustedInput = false
         let bounds = CGDisplayBounds(displayID)   // global CG coords, y-down
         let point = CGPoint(
             x: bounds.origin.x + x * bounds.width,
@@ -95,27 +105,29 @@ final class InputInjector {
         case "moved":
             type = isDown ? .leftMouseDragged : .mouseMoved
         case "ended":
-            guard isDown else { return }   // spurious up without a down
+            guard isDown else { return false }   // spurious up without a down
             type = .leftMouseUp
             isDown = false
         case "cancelled":
-            guard isDown else { return }
+            guard isDown else { return false }
             type = .leftMouseUp
             isDown = false
             clickState = 0
         default:
-            return
+            return false
         }
 
         guard let event = CGEvent(mouseEventSource: source, mouseType: type,
-                                  mouseCursorPosition: point, mouseButton: .left) else { return }
+                                  mouseCursorPosition: point, mouseButton: .left) else { return false }
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
         event.post(tap: .cghidEventTap)
+        return true
     }
 
     /// dx/dy in display pixels, natural-scrolling sign from the phone.
     /// Scroll events take points, so convert via the display's pixel scale.
     func handleScroll(dx: Double, dy: Double) {
+        guard AXIsProcessTrusted() else { return }
         let bounds = CGDisplayBounds(displayID)
         let scale = bounds.width > 0 ? Double(CGDisplayPixelsWide(displayID)) / bounds.width : 2
         guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
@@ -124,6 +136,70 @@ final class InputInjector {
                                   wheel2: Int32((dx / scale).rounded()),
                                   wheel3: 0) else { return }
         event.post(tap: .cghidEventTap)
+    }
+
+    /// Insert Unicode into the currently focused Mac control. CGEvent's
+    /// Unicode payload preserves Hebrew, emoji, dictation and autocorrection
+    /// output from the iPhone keyboard without touching the clipboard.
+    @discardableResult
+    func handleText(_ text: String) -> Bool {
+        guard AXIsProcessTrusted(), !text.isEmpty else { return false }
+        let codeUnits = Array(text.utf16)
+        guard !codeUnits.isEmpty,
+              let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
+            return false
+        }
+        codeUnits.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            down.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: base)
+            up.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: base)
+        }
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        return true
+    }
+
+    @discardableResult
+    func handleKey(_ name: String) -> Bool {
+        guard AXIsProcessTrusted() else { return false }
+        let keyCode: CGKeyCode
+        switch name {
+        case "delete": keyCode = 51
+        case "return": keyCode = 36
+        case "tab": keyCode = 48
+        case "escape": keyCode = 53
+        case "left": keyCode = 123
+        case "right": keyCode = 124
+        case "down": keyCode = 125
+        case "up": keyCode = 126
+        default: return false
+        }
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
+            return false
+        }
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        return true
+    }
+
+    /// Called shortly after a remote tap. Accessibility exposes the focused
+    /// role, allowing the phone keyboard to appear automatically for Mac text
+    /// fields while staying hidden for buttons, windows and the desktop.
+    func focusedElementAcceptsText() -> Bool {
+        guard AXIsProcessTrusted() else { return false }
+        let system = AXUIElementCreateSystemWide()
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString,
+                                            &focused) == .success,
+              let element = focused as! AXUIElement? else { return false }
+        var roleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString,
+                                            &roleValue) == .success,
+              let role = roleValue as? String else { return false }
+        return [kAXTextFieldRole as String, kAXTextAreaRole as String,
+                kAXComboBoxRole as String, "AXSearchField"].contains(role)
     }
 
     func handleProximity(entering: Bool, x: Double, y: Double) {

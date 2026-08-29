@@ -11,11 +11,14 @@ import Foundation
 /// protocol 1 — that's every install in the field that predates the handshake.
 enum WireProtocol {
     /// The protocol version this build speaks.
-    static let version = 3
+    static let version = 4
 
     /// Protocol version that introduced Apple Pencil / proximity wire messages.
     /// Peers below this get pencil input as legacy `touch` events.
     static let pencilWireVersion = 3
+
+    /// Protocol 4 adds authenticated Tailnet sessions and keyboard forwarding.
+    static let remoteAuthAndKeyboardVersion = 4
 
     /// Oldest peer protocol version this build still supports. Stays at 1
     /// (support everything) until a deliberate two-phase breaking change
@@ -34,4 +37,9 @@ enum WireMessage {
     static let updateRequired = "updateRequired"    // Mac -> phone: peer is below the Mac's floor
     static let sleeping = "sleeping"                // phone -> Mac: device locked, reconnect on wake
     static let closing = "closing"                  // phone -> Mac: app quit, end the session for good
+    static let authenticate = "authenticate"        // Mac -> phone: Tailnet pairing credential
+    static let authenticationFailed = "authFailed"  // phone -> Mac: reject missing/bad credential
+    static let keyboard = "keyboard"                // Mac -> phone: show/hide the iOS keyboard
+    static let text = "text"                        // phone -> Mac: insert Unicode text
+    static let key = "key"                          // phone -> Mac: delete/return/tab/escape
 }

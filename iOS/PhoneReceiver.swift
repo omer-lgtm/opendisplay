@@ -56,6 +56,9 @@ final class PhoneReceiver: ObservableObject {
     @Published var peerSignal: PeerUpdateSignal?
     /// Mac protocol version from the most recent `welcome` message.
     @Published private(set) var macProtocolVersion = WireProtocol.assumedWhenAbsent
+    @Published private(set) var keyboardRequestSerial = 0
+    @Published private(set) var keyboardShouldShow = false
+    @Published private(set) var remoteAccessToken = RemoteAccessSecurity.receiverToken()
 
     /// True when the connected Mac understands pencil/proximity wire messages.
     var macSupportsPencilWire: Bool { macProtocolVersion >= WireProtocol.pencilWireVersion }
@@ -63,6 +66,8 @@ final class PhoneReceiver: ObservableObject {
     private var listener: NWListener?
     private var listenerHealthy = false
     private var connection: NWConnection?
+    private var connectionRequiresAuthentication = false
+    private var connectionAuthenticated = true
     private let queue = DispatchQueue(label: "receiver.video")
     private var buffer = Data()
     private var formatDesc: CMVideoFormatDescription?
@@ -155,6 +160,14 @@ final class PhoneReceiver: ObservableObject {
     // can't get), so this is user-editable in Settings. The USB picker gets
     // the real name host-side via lockdownd regardless.
     var serviceName = "OpenDisplay"
+
+    var formattedRemoteAccessCode: String {
+        RemoteAccessSecurity.formatted(remoteAccessToken)
+    }
+
+    func regenerateRemoteAccessCode() {
+        remoteAccessToken = RemoteAccessSecurity.regenerateReceiverToken()
+    }
 
     // Stable per-install identity, advertised in the Bonjour TXT record and
     // sent in every hello. The Mac uses it to recognize "same device, other
@@ -344,6 +357,11 @@ final class PhoneReceiver: ObservableObject {
             let peer = String(describing: conn.endpoint)
             self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
                               || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
+            // USB is forwarded over a loopback socket and remains cable-trusted.
+            // Every actual network peer, including the local LAN, must prove
+            // possession of the pairing code before receiving screen bytes.
+            self.connectionRequiresAuthentication = self.transport != "USB"
+            self.connectionAuthenticated = !self.connectionRequiresAuthentication
             // Replace any existing connection and reset decoder state.
             self.connection?.cancel()
             self.connection = conn
@@ -352,8 +370,12 @@ final class PhoneReceiver: ObservableObject {
                 switch state {
                 case .ready:
                     self?.lastDataReceived = Date()
-                    self?.setConnected(true)
-                    self?.sendHello(on: conn)
+                    guard let self else { return }
+                    if self.connectionRequiresAuthentication {
+                        self.setStatus("Private server: verifying pairing code…")
+                    } else {
+                        self.activate(conn)
+                    }
                 case .failed, .cancelled:
                     self?.setConnected(false)
                 default: break
@@ -381,6 +403,12 @@ final class PhoneReceiver: ObservableObject {
         listener?.start(queue: queue)
     }
 
+    private func activate(_ conn: NWConnection) {
+        connectionAuthenticated = true
+        setConnected(true)
+        sendHello(on: conn)
+    }
+
     // MARK: - Liveness (ping + watchdog)
 
     private func schedulePing() {
@@ -398,6 +426,21 @@ final class PhoneReceiver: ObservableObject {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = obj["type"] as? String else { return }
         switch type {
+        case WireMessage.authenticate:
+            guard connectionRequiresAuthentication, !connectionAuthenticated else { return }
+            let supplied = obj["token"] as? String ?? ""
+            if RemoteAccessSecurity.timingSafeEqual(supplied, remoteAccessToken) {
+                Log.info("network peer authenticated")
+                if let connection { activate(connection) }
+            } else {
+                Log.info("network peer rejected: invalid pairing credential")
+                sendControl(["type": WireMessage.authenticationFailed])
+                queue.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                    self?.connection?.cancel()
+                    self?.connection = nil
+                    self?.setConnected(false)
+                }
+            }
         case "pong":
             guard let t1 = obj["t"] as? Double, let mt = obj["mt"] as? Double else { return }
             let t2 = nowMs
@@ -438,6 +481,12 @@ final class PhoneReceiver: ObservableObject {
             let anchor = CGPoint(x: obj["ax"] as? Double ?? 0, y: obj["ay"] as? Double ?? 0)
             let normSize = CGSize(width: nw, height: nh)
             DispatchQueue.main.async { self.onCursorImage?(image, anchor, normSize) }
+        case WireMessage.keyboard:
+            let show = (obj["show"] as? Bool) ?? ((obj["show"] as? Int) == 1)
+            DispatchQueue.main.async {
+                self.keyboardShouldShow = show
+                self.keyboardRequestSerial &+= 1
+            }
         case WireMessage.welcome:
             // The Mac identified itself (issue #132). If it speaks a protocol
             // older than we support, it's the Mac that needs updating — and an
@@ -519,6 +568,16 @@ final class PhoneReceiver: ObservableObject {
     /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).
     func sendScroll(dx: Double, dy: Double) {
         sendControl(["type": "scroll", "dx": dx, "dy": dy])
+    }
+
+    func sendText(_ text: String) {
+        guard macProtocolVersion >= WireProtocol.remoteAuthAndKeyboardVersion else { return }
+        sendControl(["type": WireMessage.text, "value": text])
+    }
+
+    func sendKey(_ name: String) {
+        guard macProtocolVersion >= WireProtocol.remoteAuthAndKeyboardVersion else { return }
+        sendControl(["type": WireMessage.key, "name": name])
     }
 
     /// Apple Pencil stroke/hover. azimuth and altitude are radians.
@@ -609,6 +668,10 @@ final class PhoneReceiver: ObservableObject {
             handleVideoChannelJSON(data)
             return
         }
+
+        // A network peer must authenticate before a single screen byte is
+        // decoded. USB retains its existing cable-trusted behavior.
+        guard connectionAuthenticated else { return }
 
         // Split on 4-byte start codes (our sender only emits 00 00 00 01).
         // Bytes before the FIRST start code are the telemetry prefix

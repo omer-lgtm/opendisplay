@@ -110,6 +110,13 @@ enum ConnectionTarget: Hashable {
         case .remote(let host, let port): return "remote:\(host):\(port)"
         }
     }
+
+    var requiresPairing: Bool {
+        switch self {
+        case .usb: return false
+        case .wifi, .remote: return true
+        }
+    }
 }
 
 /// One connected (or connecting) device: its target, its sender pipeline,
@@ -196,6 +203,12 @@ final class SenderController: ObservableObject {
     }
     @Published var remotePort = UserDefaults.standard.string(forKey: "remotePort") ?? "9000" {
         didSet { UserDefaults.standard.set(remotePort, forKey: "remotePort") }
+    }
+    @Published var remoteToken = RemoteAccessSecurity.macToken() {
+        didSet {
+            RemoteAccessSecurity.saveMacToken(remoteToken)
+            if remoteAutoConnect { connectRemote() }
+        }
     }
     @Published var remoteAutoConnect = UserDefaults.standard.bool(forKey: "remoteAutoConnect") {
         didSet {
@@ -568,7 +581,9 @@ final class SenderController: ObservableObject {
         let sender = MacSender(transport: transport, name: name, mode: mode,
                                quality: quality, displaySerial: Self.displaySerial(for: id),
                                identityOffset: identityOffset(for: id),
-                               awaitingWake: awaitingWake)
+                               awaitingWake: awaitingWake,
+                               remoteAuthToken: target.requiresPairing
+                                   ? RemoteAccessSecurity.normalized(remoteToken) : nil)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         if case .wifi(let result) = target {
             session.wifiServiceName = serviceName(of: result)
@@ -680,7 +695,8 @@ final class SenderController: ObservableObject {
     var remoteTarget: ConnectionTarget? {
         let trimmed = remoteHost.trimmingCharacters(in: .whitespacesAndNewlines)
         guard RemoteEndpointValidator.isTailnetHost(trimmed),
-              let port = UInt16(remotePort), port > 0 else { return nil }
+              let port = UInt16(remotePort), port > 0,
+              RemoteAccessSecurity.isValid(remoteToken) else { return nil }
         return .remote(host: trimmed, port: port)
     }
 
@@ -922,6 +938,8 @@ struct ContentView: View {
                 Section("Secure Remote") {
                     TextField("iPhone Tailnet IP or MagicDNS name", text: $controller.remoteHost)
                         .textContentType(.URL)
+                    SecureField("Pairing code for WiFi / remote", text: $controller.remoteToken)
+                        .textContentType(.password)
                     HStack {
                         TextField("Port", text: $controller.remotePort)
                             .frame(width: 72)
@@ -943,11 +961,11 @@ struct ContentView: View {
                     Toggle("Connect automatically when OpenDisplay starts",
                            isOn: $controller.remoteAutoConnect)
                         .disabled(controller.remoteTarget == nil)
-                    Text("Install Tailscale on both devices, sign in to the same tailnet, then enter the iPhone/iPad Tailnet address. Do not use a public IP or router port-forward: OpenDisplay's own protocol has no TLS or password.")
+                    Text("Open the iPhone/iPad app to start its private server, then enter its pairing code here. Every WiFi or Tailnet connection requires the code; Tailscale also supplies encrypted remote routing. Never expose port 9000 with router port-forwarding.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     if !controller.remoteHost.isEmpty && controller.remoteTarget == nil {
-                        Text("Enter a Tailscale IP (100.64.0.0/10 or fd7a:115c:a1e0::/48) or a full .ts.net MagicDNS name, plus a valid port.")
+                        Text("Enter a Tailscale IP (100.64.0.0/10 or fd7a:115c:a1e0::/48), a valid port, and the pairing code shown in the iPhone/iPad app.")
                             .font(.caption)
                             .foregroundStyle(.red)
                     }

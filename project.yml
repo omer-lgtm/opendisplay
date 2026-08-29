@@ -103,6 +103,7 @@ targets:
       - Mac/LogPolicies.swift
       - Mac/RemoteEndpoint.swift
       - Shared/LogSnapshot.swift
+      - Shared/RemoteAccessSecurity.swift
     settings:
       base:
         SDKROOT: macosx

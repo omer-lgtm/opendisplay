@@ -132,6 +132,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private let endpointName: String
     private let mode: CaptureMode
     private let quality: StreamQuality
+    /// Present only for a Tailnet session. Never logged or persisted here;
+    /// SenderController loads it from Keychain for this connection.
+    private let remoteAuthToken: String?
     // Stable per-device serial for the virtual display, so macOS can tell
     // multiple OpenDisplay monitors apart and persist their arrangement.
     private let displaySerial: UInt32
@@ -288,11 +291,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     init(transport: SenderTransport, name: String, mode: CaptureMode,
          quality: StreamQuality = .best, displaySerial: UInt32 = 0x0001,
-         identityOffset: UInt32 = 0, awaitingWake: Bool = false) {
+         identityOffset: UInt32 = 0, awaitingWake: Bool = false,
+         remoteAuthToken: String? = nil) {
         self.transport = transport
         self.endpointName = name
         self.mode = mode
         self.quality = quality
+        self.remoteAuthToken = remoteAuthToken
         self.displaySerial = displaySerial
         self.baseIdentityOffset = identityOffset
         self.awaitingWake = awaitingWake
@@ -358,6 +363,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // remains available while Accessibility is missing; the permission
         // panel's Grant button asks when the user is ready.
         if !AXIsProcessTrusted() {
+            // A connected phone is an explicit input-control action. Register
+            // this signed build with TCC and show the system prompt now instead
+            // of silently accepting touch packets that macOS discards.
+            _ = InputInjector.ensureAccessibilityPermission()
             await status("\(mode == .extend ? "Extending" : "Mirroring") — grant Accessibility for touch input")
             // Event posting is trust-checked per-post, so it starts working the
             // moment the user grants — poll only to log/report the transition.
@@ -894,6 +903,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         lastCursorSent = (-1, -1, false)
         lastReceived = Date()  // fresh grace period for the watchdog
         receiveControl(on: conn)
+        if let remoteAuthToken {
+            sendAuthentication(remoteAuthToken)
+        }
         Task { await self.status("Connected to \(self.endpointName)") }
     }
 
@@ -1260,18 +1272,33 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,
                let y = obj["y"] as? Double {
-                inputInjector?.handleTouch(phase: phase, x: x, y: y)
-                if let t = obj["t"] as? Double {
+                let injected = inputInjector?.handleTouch(phase: phase, x: x, y: y) ?? false
+                if injected, let t = obj["t"] as? Double {
                     let delta = Date().timeIntervalSince1970 * 1000 - t
                     if delta > -50, delta < 1000 {
                         inputLatencies.append(max(delta, 0))
                         if inputLatencies.count > 240 { inputLatencies.removeFirst(120) }
                     }
                 }
+                if injected, phase == "ended" {
+                    queue.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                        guard let self else { return }
+                        self.sendKeyboardVisibility(
+                            self.inputInjector?.focusedElementAcceptsText() ?? false)
+                    }
+                }
             }
         case "scroll":
             if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
                 inputInjector?.handleScroll(dx: dx, dy: dy)
+            }
+        case WireMessage.text:
+            if let text = obj["value"] as? String {
+                _ = inputInjector?.handleText(text)
+            }
+        case WireMessage.key:
+            if let name = obj["name"] as? String {
+                _ = inputInjector?.handleKey(name)
             }
         case "pencil":
             if let phase = obj["phase"] as? String,
@@ -1314,6 +1341,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // without the silence grace and without waiting for a wake.
             Log.info("receiver app closed — ending session")
             Task { @MainActor in self.onPeerClosed?() }
+        case WireMessage.authenticationFailed:
+            Log.info("remote authentication rejected — ending session")
+            Task { await status("Remote pairing code rejected") }
+            reportGone("remote authentication failed")
         default:
             // Unknown types are a normal consequence of the additive wire
             // protocol: a newer peer can send messages this build predates.
@@ -1720,6 +1751,21 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
            let json = String(data: data, encoding: .utf8) {
             sendJSONFrame(json)
         }
+    }
+
+    private func sendAuthentication(_ token: String) {
+        sendJSONObject(["type": WireMessage.authenticate,
+                        "token": RemoteAccessSecurity.normalized(token)])
+    }
+
+    private func sendKeyboardVisibility(_ show: Bool) {
+        sendJSONObject(["type": WireMessage.keyboard, "show": show])
+    }
+
+    private func sendJSONObject(_ object: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: object),
+              let json = String(data: data, encoding: .utf8) else { return }
+        sendJSONFrame(json)
     }
 
     private func sendJSONFrame(_ json: String) {
